@@ -193,3 +193,15 @@ tr.cancelled-row td { background: #fafafa; color: var(--muted); }
 tr.cancelled-row td > * { opacity: .8; }
 .cancel-form { margin-top: 6px; }
 .downtime-panel h2 { color: var(--bad); }
+
+/* 批量调整试算 */
+.order-field { display: block; margin: 0 0 12px; font-size: 14px; }
+.order-field input {
+  width: 100%; margin-top: 6px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
+}
+.adj-table input[type="datetime-local"] {
+  padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+}
+.adj-table .eq-checks { display: flex; flex-wrap: wrap; gap: 2px 10px; min-width: 150px; }
+.adj-table .eq-checks .check { font-size: 13px; white-space: nowrap; }

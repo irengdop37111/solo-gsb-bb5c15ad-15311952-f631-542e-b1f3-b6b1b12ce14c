@@ -15,6 +15,7 @@
         onsubmit="return confirm('将按当前器具占用、过敏原、清洁规则与器具停用状态重新计算；存在阻塞批次（含与有效停用时段相交）时不会生成版本。确认发布交接版？');">
     <button class="btn" type="submit">📦 发布交接版</button>
   </form>
+  <a class="btn ghost" href="{{ url_for('reschedule_page') }}">🧪 批量调整试算</a>
   <a class="btn ghost" href="{{ url_for('export_csv') }}">⬇ 导出 CSV</a>
   <a class="btn ghost" href="{{ url_for('export_json') }}">⬇ 导出 JSON</a>
   <a class="btn ghost" href="{{ url_for('export_cleaning_deletions_csv') }}">🧾 删除记录 CSV</a>
