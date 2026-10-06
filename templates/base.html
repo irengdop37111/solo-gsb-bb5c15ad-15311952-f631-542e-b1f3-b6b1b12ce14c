@@ -15,6 +15,7 @@
   </div>
   <nav class="wrap">
     <a href="{{ url_for('index') }}" class="{{ 'active' if request.endpoint == 'index' }}">排程看板</a>
+    <a href="{{ url_for('adjust_plan_page') }}" class="{{ 'active' if request.endpoint in ['adjust_plan_page', 'adjust_preview'] }}">多批次调整</a>
     <a href="{{ url_for('batches') }}" class="{{ 'active' if request.endpoint == 'batches' }}">批次管理</a>
     <a href="{{ url_for('equipment_page') }}" class="{{ 'active' if request.endpoint == 'equipment_page' }}">器具与清洁</a>
     <a href="{{ url_for('releases') }}" class="{{ 'active' if request.endpoint in ['releases', 'release_detail'] }}">交接版</a>

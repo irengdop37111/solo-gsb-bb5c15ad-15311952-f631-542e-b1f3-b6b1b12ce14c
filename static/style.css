@@ -193,3 +193,18 @@ tr.cancelled-row td { background: #fafafa; color: var(--muted); }
 tr.cancelled-row td > * { opacity: .8; }
 .cancel-form { margin-top: 6px; }
 .downtime-panel h2 { color: var(--bad); }
+
+/* 多批次调整 */
+.adjust-table .pos-input { width: 76px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.adjust-table input[type="datetime-local"] {
+  width: 175px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+}
+.adjust-table .eq-fieldset {
+  border: 1px dashed var(--line); border-radius: 8px; padding: 6px 10px; margin: 0;
+  display: flex; flex-wrap: wrap; gap: 4px 12px; min-width: 260px;
+}
+.adjust-table input:disabled, .adjust-table fieldset:disabled {
+  opacity: .45; background: #f9fafb; cursor: not-allowed;
+}
+tr.row-adjusted td { background: #fffbeb; }
+.adjust-preview tr td ul.change-list { margin-top: 4px; }

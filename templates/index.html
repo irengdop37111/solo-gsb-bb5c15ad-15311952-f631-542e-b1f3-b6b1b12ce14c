@@ -11,6 +11,7 @@
   <form method="post" action="{{ url_for('recalculate') }}">
     <button class="btn" type="submit">⟳ 重新计算</button>
   </form>
+  <a class="btn" href="{{ url_for('adjust_plan_page') }}">🧮 多批次调整（试算后确认）</a>
   <form method="post" action="{{ url_for('publish_release') }}"
         onsubmit="return confirm('将按当前器具占用、过敏原、清洁规则与器具停用状态重新计算；存在阻塞批次（含与有效停用时段相交）时不会生成版本。确认发布交接版？');">
     <button class="btn" type="submit">📦 发布交接版</button>

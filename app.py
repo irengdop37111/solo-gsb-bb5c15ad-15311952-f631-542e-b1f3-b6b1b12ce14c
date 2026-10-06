@@ -16,6 +16,7 @@
    与冲突时段），端点相接不算相交；受阻批次不占用器具、不留残留。
 """
 import csv
+import hashlib
 import io
 import json
 import os
@@ -106,6 +107,13 @@ CREATE TABLE IF NOT EXISTS release_item (
     status TEXT NOT NULL DEFAULT 'accepted',
     risks TEXT NOT NULL DEFAULT '[]',
     revision_note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS batch_adjust_plan (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_json TEXT NOT NULL,
+    basis_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    applied_at TEXT
 );
 """
 
@@ -273,11 +281,17 @@ def active_downtimes(conn):
     return downtimes
 
 
-def compute_schedule(conn, exclude_cleaning_id=None):
+def compute_schedule(conn, exclude_cleaning_id=None, overrides=None):
     """按当前顺序（seq, 计划开始时间）逐个尝试排入，返回每批次的结果。
 
     exclude_cleaning_id 给出的清洁记录在本次计算中视为不存在（规则本身不变），
     用于删除清洁前预演：找出因该记录失效而被阻塞的批次。
+
+    overrides 给出时按虚拟值排程（不读取覆盖批次的时段/器具，也不修改任何数据），
+    用于多批次调整前的试算，形如：
+        {batch_id: {"position": int, "start": ISO 字符串,
+                    "end": ISO 字符串, "equipment_ids": [int, ...]}}
+    批次顺序按覆盖后的 position（其次开始时间、id）排列，过敏原仍取当前配方。
     """
     eq_names = {r["id"]: r["name"] for r in conn.execute("SELECT * FROM equipment")}
     equip_of = {}
@@ -298,11 +312,23 @@ def compute_schedule(conn, exclude_cleaning_id=None):
     results = []
     rows = conn.execute(
         "SELECT * FROM batch ORDER BY seq, planned_start, id").fetchall()
+    if overrides:
+        rows = sorted(
+            rows,
+            key=lambda r: (overrides.get(r["id"], {}).get("position", 1 << 30),
+                           overrides.get(r["id"], {}).get("start")
+                           or r["planned_start"], r["id"]))
     for row in rows:
-        start = parse_dt(row["planned_start"])
-        end = parse_dt(row["planned_end"])
+        ov = overrides.get(row["id"]) if overrides else None
+        if ov is not None:
+            start = parse_dt(ov["start"])
+            end = parse_dt(ov["end"])
+        else:
+            start = parse_dt(row["planned_start"])
+            end = parse_dt(row["planned_end"])
         b_allergens = split_allergens(row["allergens"])
-        eqs = sorted(equip_of.get(row["id"], []))
+        eqs = sorted(ov["equipment_ids"] if ov is not None
+                     else equip_of.get(row["id"], []))
         blocks, risks = [], []
 
         if start is None or end is None:
@@ -408,6 +434,120 @@ def normalize_seq(conn):
     for i, r in enumerate(rows, 1):
         conn.execute("UPDATE batch SET seq=? WHERE id=?", (i, r["id"]))
     conn.commit()
+
+
+# --------------------------------------------------- 多批次调整（试算 / 确认）
+
+def schedule_basis_fingerprint(conn):
+    """排程依据（批次、器具、清洁、停用、配方）的规范化指纹。
+
+    指纹覆盖批次（含时段/顺序/过敏原）、批次-器具关联、器具、清洁记录
+    与有效停用记录；试算时记录指纹，确认时重算比对，若期间这些排程依据
+    已变化（或批次已删除），试算方案即过期，必须重新试算。
+    """
+    h = hashlib.sha256()
+
+    def feed(rows):
+        for row in rows:
+            h.update(("\x01" + json.dumps(
+                [row[k] for k in row.keys()], ensure_ascii=False,
+                default=str)).encode("utf-8"))
+
+    feed(conn.execute(
+        "SELECT id,name,allergens,planned_start,planned_end,seq FROM batch"
+        " ORDER BY id"))
+    feed(conn.execute(
+        "SELECT batch_id,equipment_id FROM batch_equipment"
+        " ORDER BY batch_id,equipment_id"))
+    feed(conn.execute("SELECT id,name FROM equipment ORDER BY id"))
+    feed(conn.execute(
+        "SELECT id,equipment_id,cleaned_at,valid_until,covers FROM cleaning"
+        " ORDER BY id"))
+    # 停用的取消状态会改变“有效停用时段”，因此同样纳入指纹
+    feed(conn.execute(
+        "SELECT id,equipment_id,start_at,end_at,reason,cancelled_at"
+        " FROM equipment_downtime ORDER BY id"))
+    return h.hexdigest()
+
+
+def build_overrides_from_plan(conn, plan):
+    """把试算方案（按目标顺序排列的批次）转为 compute_schedule 使用的 overrides。
+
+    返回 (overrides, missing_ids)；missing_ids 为方案中已不存在的批次。
+    """
+    valid_ids = {r["id"] for r in conn.execute("SELECT id FROM batch")}
+    overrides, missing_ids = {}, []
+    for item in plan["batches"]:
+        bid = int(item["batch_id"])
+        if bid not in valid_ids:
+            missing_ids.append(bid)
+            continue
+        overrides[bid] = {
+            "position": int(item["position"]),
+            "start": item["start"], "end": item["end"],
+            "equipment_ids": [int(x) for x in item["equipment_ids"]],
+        }
+    return overrides, missing_ids
+
+
+def latest_adjust_plan(conn):
+    return conn.execute(
+        "SELECT * FROM batch_adjust_plan ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def parse_adjust_plan(row):
+    """读取试算方案行并解析 plan_json；记录/内容缺失时返回 None。"""
+    if row is None:
+        return None
+    try:
+        plan = json.loads(row["plan_json"])
+        plan["_row_id"] = row["id"]
+        plan["_created_at"] = row["created_at"]
+        plan["_applied_at"] = row["applied_at"]
+        plan["_basis"] = row["basis_fingerprint"]
+    except (TypeError, ValueError, KeyError):
+        return None
+    return plan
+
+
+def preview_compare(before_results, after_results):
+    """逐批对比试算前后：状态变化、时段/器具/顺序差异。
+
+    返回 {batch_id: {"status_change": str|None, "changes": [str, ...]}}。
+    """
+    before = {r["id"]: r for r in before_results}
+    status_text = {"accepted": "已排入", "blocked": "已拒绝"}
+    compare = {}
+    for i, r in enumerate(after_results, 1):
+        b = before.get(r["id"])
+        changes = []
+        if b is not None:
+            b_start = b["start"].isoformat(timespec="minutes") if b["start"] else ""
+            b_end = b["end"].isoformat(timespec="minutes") if b["end"] else ""
+            a_start = r["start"].isoformat(timespec="minutes") if r["start"] else ""
+            a_end = r["end"].isoformat(timespec="minutes") if r["end"] else ""
+            if b_start != a_start or b_end != a_end:
+                fmt = lambda s: (s or "").replace("T", " ") or "—"  # noqa: E731
+                changes.append(
+                    f"时段：{fmt(b_start)} ~ {fmt(b_end)}"
+                    f" → {fmt(a_start)} ~ {fmt(a_end)}")
+            if "、".join(b["equipment_names"]) != "、".join(r["equipment_names"]):
+                changes.append(
+                    f"器具：{('、'.join(b['equipment_names']) or '—')}"
+                    f" → {('、'.join(r['equipment_names']) or '—')}")
+            # b 在原排程中的位置
+            b_pos = list(before).index(b["id"]) + 1
+            if b_pos != i:
+                changes.append(f"顺序：第 {b_pos} 位 → 第 {i} 位")
+        status_change = None
+        if b is not None and b["status"] != r["status"]:
+            status_change = (
+                f"{status_text.get(b['status'], b['status'])}"
+                f" → {status_text.get(r['status'], r['status'])}")
+        compare[r["id"]] = {"status_change": status_change,
+                            "changes": changes}
+    return compare
+
 
 
 def cleaning_cover_text(covers):
@@ -861,6 +1001,285 @@ def cancel_downtime(did):
         conn.commit()
         flash(f"停用记录 #{did} 已取消，该时段不再阻塞排程", "ok")
     return redirect(url_for("equipment_page"))
+
+
+# -------------------------------------------- 多批次调整（试算 / 确认）
+
+def _adjust_form_errors(conn, form):
+    """校验多批次调整表单，返回 (errors, batches)。
+
+    batches 为按目标顺序排列的调整方案：
+        [{"batch_id", "position", "start", "end", "equipment_ids",
+          "adjusted": bool}]
+    校验：所有现有批次都必须给出不重复且连续的目标顺序（1..N）；
+    勾选调整的批次时段必须可解析且结束晚于开始、至少使用一个存在的器具。
+    任何一项不通过都拒绝试算。
+    """
+    rows = conn.execute(
+        "SELECT * FROM batch ORDER BY seq, planned_start, id").fetchall()
+    if not rows:
+        return ["当前没有任何批次，无法调整排程"], []
+    ids = {r["id"] for r in rows}
+    submitted_ids = set()
+    for key in form:
+        if key.startswith("pos_"):
+            try:
+                submitted_ids.add(int(key[4:]))
+            except ValueError:
+                pass
+    unknown = submitted_ids - ids
+    if unknown:
+        return [f"批次不存在或已删除（id: {', '.join(map(str, sorted(unknown)))}），"
+                f"请刷新页面后重新试算"], []
+    missing = ids - submitted_ids
+    if missing:
+        names = "、".join(
+            f"「{r['name']}」" for r in rows if r["id"] in missing)
+        return [f"目标顺序不完整：缺少批次 {names} 的目标位置"], []
+
+    eq_ids = {r["id"] for r in conn.execute("SELECT id FROM equipment")}
+    entries, errors = [], []
+    positions = []
+    for r in rows:
+        bid = r["id"]
+        row_errors = []
+        raw_pos = form.get(f"pos_{bid}", "").strip()
+        try:
+            pos = int(raw_pos)
+        except ValueError:
+            errors.append(f"批次「{r['name']}」的目标顺序无效："
+                          f"请填写 1 到 {len(rows)} 之间的整数")
+            continue
+        positions.append((bid, r["name"], pos))
+        adjusted = form.get(f"adjust_{bid}") == "1"
+        start = form.get(f"start_{bid}", "").strip()
+        end = form.get(f"end_{bid}", "").strip()
+        eq_vals = form.getlist(f"equipment_{bid}")
+        if not adjusted:
+            # 未勾选调整：保持现有时段与器具，仅参与新的目标顺序
+            start = r["planned_start"]
+            end = r["planned_end"]
+            eq_vals = [str(x[0]) for x in conn.execute(
+                "SELECT equipment_id FROM batch_equipment"
+                " WHERE batch_id=? ORDER BY equipment_id",
+                (bid,)).fetchall()]
+        else:
+            if not start or not end:
+                row_errors.append(
+                    f"批次「{r['name']}」已勾选调整，但未填写完整的预计起止时间")
+                start = start or None
+                end = end or None
+            s_dt = parse_dt(start) if start else None
+            e_dt = parse_dt(end) if end else None
+            if start and s_dt is None:
+                row_errors.append(f"批次「{r['name']}」的预计开始时间无效，"
+                                  f"请使用 YYYY-MM-DDTHH:MM 格式")
+            if end and e_dt is None:
+                row_errors.append(f"批次「{r['name']}」的预计结束时间无效，"
+                                  f"请使用 YYYY-MM-DDTHH:MM 格式")
+            if s_dt and e_dt and e_dt <= s_dt:
+                row_errors.append(f"批次「{r['name']}」的时段无效："
+                                  f"结束时间必须晚于开始时间")
+            if not eq_vals:
+                row_errors.append(
+                    f"批次「{r['name']}」已勾选调整，但未选择任何器具")
+        chosen = []
+        for v in eq_vals:
+            try:
+                eid = int(v)
+            except (TypeError, ValueError):
+                row_errors.append(
+                    f"批次「{r['name']}」选择了不存在的器具（{v}）")
+                continue
+            if eid not in eq_ids:
+                row_errors.append(
+                    f"批次「{r['name']}」选择了不存在或已删除的器具（id={eid}）")
+                continue
+            chosen.append(eid)
+        if row_errors:
+            errors.extend(row_errors)
+            continue
+        entries.append({
+            "batch_id": bid, "position": pos, "start": start, "end": end,
+            "equipment_ids": sorted(chosen), "adjusted": adjusted,
+        })
+    seen = {}
+    for bid, name, pos in positions:
+        if pos < 1 or pos > len(rows):
+            errors.append(f"批次「{name}」的目标顺序 {pos} 超出范围"
+                          f"（应为 1 到 {len(rows)}）")
+        if pos in seen:
+            errors.append(f"目标顺序重复：批次「{seen[pos]}」与「{name}」"
+                          f"都排在第 {pos} 位")
+        seen[pos] = name
+    if set(seen) != set(range(1, len(rows) + 1)):
+        missing_pos = sorted(set(range(1, len(rows) + 1)) - set(seen))
+        if missing_pos:
+            errors.append("目标顺序缺失或重复：缺少位置 "
+                          + "、".join(map(str, missing_pos)))
+    if errors:
+        return errors, []
+
+    order_now = [r["id"] for r in rows]
+    order_new = [e["batch_id"] for e in sorted(entries,
+                                               key=lambda x: x["position"])]
+    any_change = any(e["adjusted"] for e in entries) or order_new != order_now
+    if not any_change:
+        return ["未检测到任何调整（时段、器具与目标顺序均未变化），无需试算"], []
+    entries.sort(key=lambda x: x["position"])
+    return [], entries
+
+
+@app.route("/adjust", methods=["GET", "POST"])
+def adjust_plan_page():
+    """多批次调整：填写所选批次的新时段/器具及全部批次的目标顺序。
+
+    POST 只做校验与试算（compute_schedule + 覆盖值），并把方案暂存到
+    batch_adjust_plan；实时排程、导出与已发布交接版均不受影响。
+    """
+    conn = get_db()
+    if request.method == "POST":
+        errors, batches = _adjust_form_errors(conn, request.form)
+        if errors:
+            for msg in errors:
+                flash(f"未试算：{msg}", "error")
+            return redirect(url_for("adjust_plan_page"))
+        plan = {"batches": batches}
+        overrides, missing = build_overrides_from_plan(conn, plan)
+        if missing:
+            flash("未试算：部分批次已不存在（id: "
+                  + ", ".join(map(str, sorted(missing))) + "），请重新试算",
+                  "error")
+            return redirect(url_for("adjust_plan_page"))
+        # 试算：仅内存计算 + 暂存方案，不触碰批次表/关联表，不影响实时排程
+        fingerprint = schedule_basis_fingerprint(conn)
+        with conn:
+            conn.execute(
+                "DELETE FROM batch_adjust_plan WHERE applied_at IS NULL")
+            conn.execute(
+                "INSERT INTO batch_adjust_plan(plan_json, basis_fingerprint,"
+                " created_at) VALUES (?,?,?)",
+                (json.dumps(plan, ensure_ascii=False), fingerprint,
+                 datetime.now().isoformat(timespec="seconds")))
+        flash("试算完成：以下为调整后的完整排程（未写入实时排程，可继续修改后重新试算）",
+              "ok")
+        return redirect(url_for("adjust_preview"))
+
+    rows = conn.execute(
+        "SELECT * FROM batch ORDER BY seq, planned_start, id").fetchall()
+    equipment = conn.execute("SELECT * FROM equipment ORDER BY id").fetchall()
+    eq_names = {r["id"]: r["name"] for r in equipment}
+    equip_of = {}
+    for r in conn.execute("SELECT * FROM batch_equipment"):
+        equip_of.setdefault(r["batch_id"], set()).add(r["equipment_id"])
+    pending = parse_adjust_plan(latest_adjust_plan(conn))
+    if pending is not None and pending.get("_applied_at"):
+        pending = None
+    return render_template("adjust.html", rows=rows, equipment=equipment,
+                           eq_names=eq_names, equip_of=equip_of,
+                           pending=pending)
+
+
+@app.route("/adjust/preview")
+def adjust_preview():
+    """展示最近一次试算的整体影响：逐批对比调整前后的状态、风险或阻塞原因。
+
+    页面打开时按当前数据重新模拟；若排程依据（批次/器具/清洁/停用/配方）
+    已较试算时变化，方案标记为过期，只能返回重新试算（不能确认）。
+    """
+    conn = get_db()
+    row = latest_adjust_plan(conn)
+    plan = parse_adjust_plan(row)
+    if plan is None or plan.get("_applied_at"):
+        flash("没有可预览的试算方案：请先在多批次调整页填写调整内容并试算",
+              "error")
+        return redirect(url_for("adjust_plan_page"))
+    overrides, missing = build_overrides_from_plan(conn, plan)
+    stale = bool(missing) or (
+        schedule_basis_fingerprint(conn) != plan["_basis"])
+    before_results = compute_schedule(conn)
+    after_results = (compute_schedule(conn, overrides=overrides)
+                     if not missing else [])
+    compare = preview_compare(before_results, after_results)
+    after_accepted = sum(1 for r in after_results
+                         if r["status"] == "accepted")
+    return render_template(
+        "adjust_preview.html", plan=plan, results=after_results,
+        before_map={r["id"]: r for r in before_results},
+        compare=compare, stale=stale, missing_ids=missing,
+        after_accepted=after_accepted,
+        after_blocked=len(after_results) - after_accepted)
+
+
+@app.post("/adjust/cancel")
+def adjust_cancel():
+    """放弃当前试算方案（仅删除暂存行，不影响任何排程数据）。"""
+    conn = get_db()
+    conn.execute("DELETE FROM batch_adjust_plan WHERE applied_at IS NULL")
+    conn.commit()
+    flash("已放弃本次试算方案，实时排程未发生任何变化", "ok")
+    return redirect(url_for("adjust_plan_page"))
+
+
+@app.post("/adjust/apply")
+def adjust_apply():
+    """一次性保存试算方案：在写锁事务内先复核方案未过期，再整体写入。
+
+    批次、器具、清洁、停用或配方等排程依据自试算后发生变化（或批次已删除）
+    时拒绝过期方案、不写入任何数据，提示重新试算。允许保存含阻塞批次的
+    方案（实时排程随之更新，仍按原规则阻塞）；已发布交接版保持原样，
+    交接版发布规则不变（存在阻塞批次时不能发布）。
+    """
+    conn = get_db()
+    row = latest_adjust_plan(conn)
+    plan = parse_adjust_plan(row)
+    if plan is None or plan.get("_applied_at"):
+        flash("没有待确认的试算方案，请先试算后再确认", "error")
+        return redirect(url_for("adjust_plan_page"))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试确认", "error")
+        return redirect(url_for("adjust_preview"))
+    try:
+        overrides, missing = build_overrides_from_plan(conn, plan)
+        if missing or schedule_basis_fingerprint(conn) != plan["_basis"]:
+            conn.rollback()
+            flash("方案已过期，未保存任何调整：试算后批次、器具、清洁、"
+                  "停用或配方等排程依据已发生变化（或批次已删除），"
+                  "请重新试算后再确认", "error")
+            return redirect(url_for("adjust_preview"))
+        ts = datetime.now().isoformat(timespec="seconds")
+        for item in plan["batches"]:
+            bid = int(item["batch_id"])
+            conn.execute(
+                "UPDATE batch SET planned_start=?, planned_end=?, seq=?"
+                " WHERE id=?",
+                (item["start"], item["end"], int(item["position"]), bid))
+            conn.execute("DELETE FROM batch_equipment WHERE batch_id=?",
+                         (bid,))
+            for eid in item["equipment_ids"]:
+                conn.execute(
+                    "INSERT INTO batch_equipment(batch_id, equipment_id)"
+                    " VALUES (?,?)", (bid, int(eid)))
+        conn.execute(
+            "UPDATE batch_adjust_plan SET applied_at=? WHERE id=?",
+            (ts, plan["_row_id"]))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    final_results = {r["id"]: r["status"] for r in compute_schedule(conn)}
+    blocked_n = sum(1 for item in plan["batches"]
+                    if final_results.get(int(item["batch_id"])) != "accepted")
+    adjusted_n = sum(1 for b in plan["batches"] if b.get("adjusted"))
+    flash(f"已一次性保存全部调整：{len(plan['batches'])} 个批次的顺序、"
+          f"{adjusted_n} 个批次的时段/器具已更新，实时排程已随之重新计算；"
+          + (f"其中 {blocked_n} 个批次仍按原规则处于阻塞状态，"
+             f"不影响已发布交接版，交接版仍需全部批次可排入时才能发布。"
+             if blocked_n else "全部批次均可排入；已发布交接版保持原样。"),
+          "ok")
+    return redirect(url_for("index"))
 
 
 # ---------------------------------------------------------------- 导出

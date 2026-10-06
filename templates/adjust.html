@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}多批次调整 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+{% if pending %}
+<section class="panel" style="border-left:4px solid var(--warn);">
+  <h2>有一份尚未确认的试算方案</h2>
+  <p class="hint">
+    试算于 {{ pending._created_at.replace('T', ' ') }} 生成。重新提交本表单会覆盖旧方案
+    （旧方案仅为暂存，不影响实时排程）；也可以直接查看 / 确认或放弃它。
+  </p>
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('adjust_preview') }}">查看试算结果并确认</a>
+    <form method="post" action="{{ url_for('adjust_cancel') }}">
+      <button class="btn ghost" type="submit">放弃旧方案</button>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>多批次调整（先试算，确认后才写入）</h2>
+  <p class="hint">
+    <strong>用法：</strong>勾选需要调整的批次并填写新的预计起止与所用器具；
+    同时在「目标顺序」中给出<strong>包含全部现有批次</strong>的完整顺序（位置 1 ~ {{ rows|length }}，
+    不缺不重）。点击「🧮 试算」后按当前器具占用、过敏原残留、清洁有效期与停用规则
+    模拟完整排程，逐批展示调整前后的状态、风险或阻塞原因。
+    试算<strong>不会</strong>改变实时排程、导出与已发布交接版；确认时若排程依据已变化
+    （批次 / 器具 / 清洁 / 停用 / 配方），会拒绝过期方案并要求重新试算。
+    含阻塞批次的方案也可以保存（实时排程仍按原规则限制交接版发布）。
+  </p>
+  {% if not rows %}
+  <p class="empty">当前没有任何批次，请先到 <a href="{{ url_for('batches') }}">批次管理</a> 录入。</p>
+  {% else %}
+  <form method="post" action="{{ url_for('adjust_plan_page') }}" id="adjust-form">
+    <table class="adjust-table">
+      <thead>
+        <tr>
+          <th>调整</th><th>批次 / 过敏原</th>
+          <th>目标顺序</th><th>新预计开始</th><th>新预计结束</th><th>新所用器具</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for b in rows %}
+        <tr class="adjust-row" data-bid="{{ b.id }}">
+          <td>
+            <input type="checkbox" name="adjust_{{ b.id }}" value="1"
+                   class="adjust-check" title="勾选后该批次使用新时段与新器具">
+          </td>
+          <td>
+            <strong>{{ b.name }}</strong><br>
+            <span class="tags">
+              {% for a in b.allergens.split(',') if a.strip() %}<span class="tag">{{ a.strip() }}</span>
+              {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+            </span><br>
+            <span class="muted">现序第 {{ loop.index }} 位 ·
+              {{ b.planned_start.replace('T', ' ') }} ~ {{ b.planned_end.replace('T', ' ') }}
+            </span>
+          </td>
+          <td><input type="number" name="pos_{{ b.id }}" value="{{ loop.index }}"
+                     min="1" max="{{ rows|length }}" class="pos-input" required></td>
+          <td><input type="datetime-local" name="start_{{ b.id }}"
+                     value="{{ b.planned_start }}" class="dt-input" disabled></td>
+          <td><input type="datetime-local" name="end_{{ b.id }}"
+                     value="{{ b.planned_end }}" class="dt-input" disabled></td>
+          <td>
+            <fieldset class="eq-fieldset" disabled>
+              {% for e in equipment %}
+              <label class="check">
+                <input type="checkbox" name="equipment_{{ b.id }}" value="{{ e.id }}"
+                       {% if e.id in (equip_of.get(b.id) or []) %}checked{% endif %}>
+                {{ e.name }}
+              </label>
+              {% endfor %}
+            </fieldset>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="form-actions" style="margin-top:14px;">
+      <button class="btn" type="submit">🧮 试算（不写入实时排程）</button>
+      <a class="btn ghost" href="{{ url_for('index') }}">取消并返回看板</a>
+    </div>
+  </form>
+  {% endif %}
+</section>
+
+<script>
+// 勾选某行后才启用该行的新时段 / 新器具输入；改动时段、器具或目标顺序时
+// 自动勾选该行（未勾选的行保持现有数据，仅参与新的目标顺序）。
+document.querySelectorAll('.adjust-row').forEach(function (row) {
+  var check = row.querySelector('.adjust-check');
+  var dtInputs = row.querySelectorAll('.dt-input');
+  var eqField = row.querySelector('.eq-fieldset');
+  function sync() {
+    var on = check.checked;
+    dtInputs.forEach(function (el) { el.disabled = !on; });
+    eqField.disabled = !on;
+    row.classList.toggle('row-adjusted', on);
+  }
+  check.addEventListener('change', sync);
+  dtInputs.forEach(function (el) {
+    el.addEventListener('input', function () {
+      if (el.value && el.value !== el.defaultValue) { check.checked = true; sync(); }
+    });
+  });
+  eqField.querySelectorAll('input[type="checkbox"]').forEach(function (el) {
+    el.addEventListener('change', function () { check.checked = true; sync(); });
+  });
+  sync();
+});
+</script>
+{% endblock %}
